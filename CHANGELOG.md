@@ -2,6 +2,18 @@
 
 All notable changes to this skill will be documented in this file.
 
+## [0.2.0] - 2026-02-21
+
+### Added
+- `references/observability.md` — comprehensive observability guide: trace/span architecture, cost monitoring, error classification, performance profiling, OTel bridge, production alerting, session replay, eval-driven quality, industry analysis
+- Observability section in SKILL.md with pi-mono primitives and six implementation pillars
+- Optional development feedback collection mechanism (`.pidev_feedback/` directory) for community-driven skill improvement
+
+### Changed
+- Security model expanded from four layers to five (added code execution sandbox layer)
+- Updated production.md to reference observability.md for detailed patterns
+- README updated with observability entry, feedback section, and opt-out instructions
+
 ## [0.1.0] - 2026-02-21
 
 ### Added

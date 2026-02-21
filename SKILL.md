@@ -172,9 +172,37 @@ Five-layer defense:
 
 **Code execution sandboxing** is now an industry consensus for production agents. Options range from embedded interpreters (Pydantic Monty: <1μs startup) to isolated workers (Cloudflare CodeMode) to cloud sandboxes (E2B, Daytona). See [references/security.md](references/security.md) for full comparison table and implementation patterns.
 
+## Observability, Debugging & Monitoring
+
+Agent apps are **non-deterministic, multi-step, and expensive**. Unlike traditional software, there's no `EXPLAIN` query — you need full-stack observability to understand agent behavior.
+
+**Industry consensus (2025-2026):** All major frameworks (OpenAI Agents SDK, PydanticAI/Logfire, LangChain/LangSmith, Agno, Cloudflare AI Gateway) converge on a **Traces → Spans** hierarchy aligned with OpenTelemetry GenAI Semantic Conventions (v1.40.0).
+
+**Pi-mono's observability primitives:**
+
+| Primitive | What it gives you |
+|-----------|-------------------|
+| `session.subscribe(event)` | Full event stream: agent/turn/message/tool lifecycle |
+| `event.message.usage` | Per-turn token counts + cost breakdown (input/output/cache) |
+| `session.getSessionStats()` | Aggregate session-level metrics |
+| `session.getContextUsage()` | Real-time context window utilization |
+| `StreamOptions.onPayload` | Raw provider HTTP payload inspection ("show me the prompt") |
+| `session.exportToHtml()` | Full conversation replay for debugging |
+
+**Six pillars to implement:**
+
+1. **Structured tracing** — emit JSON logs with traceId/spanId for every LLM call and tool execution
+2. **Cost monitoring** — per-request budgets, per-user/24h limits, per-tool cost attribution
+3. **Error classification** — categorize failures (LLM API error, tool error, context overflow, agent stuck loop, budget exceeded)
+4. **Performance profiling** — time-to-first-token, tool execution duration, turn count, total latency
+5. **OTel bridge** — map pi-mono events to OpenTelemetry spans for export to any observability platform (Langfuse, Logfire, LangSmith, Datadog, etc.)
+6. **Eval-driven quality** — automated checks per agent run (completion, expected tools, cost bounds, loop detection) + regression test datasets
+
+See [references/observability.md](references/observability.md) for detailed architecture, all 9 implementation patterns with code, OTel integration, and production checklist.
+
 ## Production Essentials
 
-**Cost control**: Monitor `event.message.usage.cost.total` per turn; abort if budget exceeded.
+**Cost control**: Monitor `event.message.usage.cost.total` per turn; abort if budget exceeded. See observability patterns for per-user/24h budget enforcement.
 
 **Timeout**: Use `AbortController` with total timeout; set max turns in settings.
 
@@ -183,8 +211,6 @@ Five-layer defense:
 **Multi-model strategy**: Use cheap model (Haiku) for simple tasks, strong model (Sonnet/Opus) + thinking for complex tasks. Pi-ai's `getModel()` makes switching trivial.
 
 **Context management**: For long tasks, enable compaction in settings. For cross-request memory, serialize `Context` with `JSON.stringify()` and restore later — works across providers.
-
-**Observability**: Subscribe to all events and emit structured logs with `sessionId`, `toolName`, `duration`, `isError`.
 
 See [references/production.md](references/production.md) for detailed patterns with code.
 
@@ -230,4 +256,27 @@ import { getModel, stream, complete, Type, StringEnum, type Context, type Tool }
 - [references/tool-design.md](references/tool-design.md) — Bash vs custom tools analysis, hybrid architecture, Anthropic research findings, tool code examples
 - [references/security.md](references/security.md) — Five-layer security model, code execution sandbox comparison (Monty/CodeMode/Docker/E2B/Daytona/SmolAgents), sandbox implementation patterns, human-in-the-loop
 - [references/integration-patterns.md](references/integration-patterns.md) — SDK embedding, RPC subprocess, extension patterns, OpenClaw case study
-- [references/production.md](references/production.md) — Cost control, timeouts, multi-model, context management, observability, testing
+- [references/observability.md](references/observability.md) — Trace/span architecture, cost monitoring, error classification, performance profiling, OTel bridge, production alerting, session replay, eval-driven quality, industry analysis (OpenAI/PydanticAI/LangChain/Agno/Cloudflare)
+- [references/production.md](references/production.md) — Cost control, timeouts, multi-model, context management, structured output, testing
+
+## Development Feedback Collection (Optional)
+
+This skill is actively maintained. When encountering genuine friction points during
+real development, log them to `<project>/.pidev_feedback/<YYYY-MM-DD>_<short-topic>.md`.
+
+Three types worth recording:
+
+1. **Gap** — A recurring problem/pattern this skill doesn't cover but should
+2. **Correction** — Skill guidance that didn't work as described
+3. **Improvement** — Guidance that worked but could be clearer or more complete
+
+Each entry should contain:
+
+- **Type**: Gap / Correction / Improvement
+- **Scenario**: What was being built or done (describe the task only — no usernames, API keys, internal URLs, or any identifying information)
+- **Issue**: What happened, or what was missing
+- **Resolution**: How it was actually solved (if resolved)
+
+Only create this directory and log entries when a real issue is encountered — do not
+proactively generate feedback. Contributors can submit these files as issues at
+https://github.com/Crokily/pi-agent-app-dev to help improve this skill.

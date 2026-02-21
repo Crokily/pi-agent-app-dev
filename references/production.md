@@ -121,6 +121,10 @@ ctx.compact({ customInstructions: "Preserve all error messages and container IDs
 
 ## Observability
 
+For comprehensive observability patterns including structured tracing, cost monitoring, error classification, performance profiling, OpenTelemetry integration, production alerting, session replay, and eval-driven quality monitoring, see **[observability.md](observability.md)**.
+
+Basic event logging for quick setup:
+
 ```typescript
 session.subscribe((event) => {
   const base = { sessionId: session.sessionId, ts: Date.now() };
