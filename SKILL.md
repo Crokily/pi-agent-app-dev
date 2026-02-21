@@ -160,16 +160,17 @@ for (let turn = 0; turn < 10; turn++) {
 
 **Golden rule: NEVER trust System Prompt as a security boundary.** LLMs can be prompt-injected. All security MUST be hardcoded in tool `execute` functions.
 
-Four-layer defense:
+Five-layer defense:
 
 | Layer | Mechanism | Reliability |
 |-------|-----------|-------------|
 | Tool-level validation | Hardcoded checks in `execute()` | ★★★★★ Strongest |
 | Extension event gates | `pi.on("tool_call", …)` → `{ block: true }` | ★★★★ Strong |
+| Code execution sandbox | Monty / CodeMode / Docker / E2B | ★★★★★ Strongest |
 | System Prompt rules | "Do not delete..." in prompt | ★★ Weak (bypassable) |
-| Infrastructure isolation | Sandbox, cgroup, network namespace | ★★★★★ Strongest |
+| Infrastructure isolation | Container, cgroup, network namespace | ★★★★★ Strongest |
 
-See [references/security.md](references/security.md) for implementation patterns.
+**Code execution sandboxing** is now an industry consensus for production agents. Options range from embedded interpreters (Pydantic Monty: <1μs startup) to isolated workers (Cloudflare CodeMode) to cloud sandboxes (E2B, Daytona). See [references/security.md](references/security.md) for full comparison table and implementation patterns.
 
 ## Production Essentials
 
@@ -227,6 +228,6 @@ import { getModel, stream, complete, Type, StringEnum, type Context, type Tool }
 ## References
 
 - [references/tool-design.md](references/tool-design.md) — Bash vs custom tools analysis, hybrid architecture, Anthropic research findings, tool code examples
-- [references/security.md](references/security.md) — Four-layer security model, permission gate extensions, sandbox patterns
+- [references/security.md](references/security.md) — Five-layer security model, code execution sandbox comparison (Monty/CodeMode/Docker/E2B/Daytona/SmolAgents), sandbox implementation patterns, human-in-the-loop
 - [references/integration-patterns.md](references/integration-patterns.md) — SDK embedding, RPC subprocess, extension patterns, OpenClaw case study
 - [references/production.md](references/production.md) — Cost control, timeouts, multi-model, context management, observability, testing
