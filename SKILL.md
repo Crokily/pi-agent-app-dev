@@ -1,282 +1,241 @@
 ---
 name: pi-agent-app-dev
-description: "Best practices for building agent-powered applications (not chatbots) using pi-mono SDK (@mariozechner/pi-ai, @mariozechner/pi-agent-core, @mariozechner/pi-coding-agent). Use when the task involves: designing agent application architecture, embedding agent capabilities into web/backend services, defining tools for agents, choosing between bash and custom tools, writing system prompts for agent executors, implementing security for autonomous agents, building agent-as-backend systems, integrating pi-mono SDK into existing applications, creating Extensions or Skills for pi, or any development where an LLM agent loop drives real-world actions (deployment, infrastructure, data processing) rather than conversation."
+description: "Best practices for building agent-powered applications using pi-mono SDK (@mariozechner/pi-ai, @mariozechner/pi-agent-core, @mariozechner/pi-coding-agent). Use when the task involves: designing agent application architecture, embedding agent capabilities into web/backend services, writing system prompts for agent executors, implementing security for autonomous agents, building agent-as-backend systems, integrating pi-mono SDK into existing applications, creating Extensions or Skills for pi, or any development where an LLM agent loop drives real-world actions (deployment, infrastructure, data processing) rather than conversation."
 ---
 
 # Pi-Mono Agent Application Development
 
-## Core Philosophy
+## Core Philosophy: Environment Provider, Not Orchestrator
 
-Agent applications ≠ chatbots. Build **autonomous execution engines** that receive user intent, plan steps, call tools, handle errors, and deliver results — not conversational interfaces.
+Agent-driven applications ≠ traditional AI workflows. Do not build an orchestration graph that calls LLMs at each node. Instead, **provide an environment** where the agent autonomously decides what to do, verifies its own work, and self-corrects.
+
+> "Give as much control as possible to the language model itself, and keep the scaffolding minimal." — Anthropic, SWE-bench
+>
+> "Claude Code embraces radical simplicity. The team deliberately minimizes business logic, allowing the underlying model to perform most work." — Pragmatic Engineer
+>
+> "Maybe the best architecture is almost no architecture at all. Just filesystems and bash." — Vercel
 
 **The formula:**
 ```
-Agent App = Tools (capabilities) + System Prompt (rules) + Agent Loop (engine)
+Agent App = Environment (tools + filesystem + state) + Harness (prompt + rules + permissions + hooks) + Loop (engine)
 ```
 
-- **Tools**: Define what the agent CAN do (Docker ops, DB queries, API calls)
-- **System Prompt**: Define what the agent SHOULD do (safety rules, scope, behavior)
-- **Agent Loop**: The SDK's core cycle: prompt → LLM decision → tool call → result → continue/finish
+The **environment** gives the agent capabilities. The **harness** steers it without constraining its approach. The **loop** runs until the agent decides it is done.
 
-## Pi-Mono Architecture (choose your layer)
+## The Two Paradigms
+
+Understand which paradigm you are building before writing code:
+
+| | App-Driven (Orchestration) | Agent-Driven (Harness) |
+|---|---|---|
+| **Who decides next step** | Your code (graph/workflow) | The model (via prompt + tools) |
+| **Frameworks** | LangGraph, PydanticAI workflows, Mastra | Claude Agent SDK, Pi SDK, OpenCode |
+| **Control surface** | Explicit nodes, edges, routing logic | System prompt, permissions, skills, hooks |
+| **Best for** | Predictable pipelines, compliance-critical flows | Open-ended tasks, self-healing, creative problem-solving |
+| **Anti-pattern** | Using an agent SDK but hardcoding every step as a tool | Giving the agent infinite freedom with no harness |
+
+**This skill is for the agent-driven paradigm.** If your task is better served by a deterministic pipeline, use traditional orchestration.
+
+## Tool Design: Less Is More
+
+### The Default Toolset: bash + read + write + edit
+
+Pi's 4 built-in tools (~1000 tokens total) are sufficient for most agent applications. Bash alone gives the agent access to the entire Unix environment — docker, curl, git, grep, jq, and anything else installed.
+
+> Vercel deleted 17 specialized tools and replaced them with 1 bash tool. Success rate went from 80% → 100%, 3.5x faster, 37% fewer tokens.
+
+**Start with zero custom tools. Add them only when you hit a concrete problem bash cannot solve safely.**
+
+### When Custom Tools Are Justified
+
+Only three situations justify a custom tool:
+
+1. **Security-critical operations** — The tool must enforce access control that the LLM cannot bypass via prompt injection. Hardcode ownership checks, allowlists, rate limits in `execute()`.
+
+2. **Structured output for your app layer** — Your application needs to parse a typed JSON result (e.g., `{ instanceId, port, status }`) rather than scraping stdout text.
+
+3. **Transactional / external API operations** — Database transactions, OAuth flows, or third-party API calls with retry logic that bash cannot reliably encapsulate.
+
+If your custom tool is just a function wrapper with no validation, verification, or structured return — **delete it and let the agent use bash**.
+
+See [references/tool-design.md](references/tool-design.md) for detailed patterns and code examples.
+
+### Anti-Pattern: The Message Passer
+
+The most common mistake when building with agent-driven SDKs:
 
 ```
-Layer 3: pi-coding-agent  → createAgentSession() — full app layer (sessions, extensions, skills)
-Layer 2: pi-agent-core    → Agent / agentLoop()   — engine layer (tool calling, events, state)
+❌ BAD: Button click → create Task in DB → agent picks up task
+   → agent calls instance_create tool (which is just the old function)
+   → tool returns result → agent calls report_result → done
+
+   Agent added zero intelligence. It's just a slow, unreliable function router.
+```
+
+```
+✅ GOOD: Button click → agent receives goal + environment context
+   → agent inspects current state (bash: docker ps, curl health endpoints)
+   → agent decides what to create and how
+   → agent creates instance (bash or minimal custom tool)
+   → agent verifies instance is healthy (curl, docker inspect)
+   → agent diagnoses and fixes problems if unhealthy
+   → agent reports structured result only after verification
+```
+
+The difference: the agent **thinks, verifies, and self-corrects**. That is the value proposition.
+
+## Harness Design: Steering Without Constraining
+
+In agent-driven systems, the harness replaces the workflow graph. It is the developer's primary control surface.
+
+### The Five Harness Elements
+
+| Element | Purpose | Example |
+|---------|---------|---------|
+| **System prompt** | Rules, goals, verification procedures, behavioral constraints | "After creating an instance, verify it responds to health checks" |
+| **AGENTS.md / Skills** | Domain knowledge injected on-demand into context | Deployment procedures, error diagnosis playbooks |
+| **Filesystem state** | Shared memory between agent turns, sessions, and sub-agents | `/tmp/deploy-state.json`, checklist files, plan files |
+| **Hooks / Extensions** | Code-level interception points for security gates and context injection | `pi.on("tool_call")` to block dangerous bash commands |
+| **Permissions** | Restrict tool access based on trust level or context | Read-only mode for exploration, full access for execution |
+
+### System Prompt Design
+
+The system prompt is the most important piece of an agent-driven application. It is where you encode **judgment**, not just instructions.
+
+**Principles:**
+- **Be specific about verification**: "After deploying, run `curl -sf http://localhost:{port}/health` and confirm HTTP 200"
+- **Encode recovery strategies**: "If health check fails, check `docker logs --tail 50` for errors. If OOM, increase memory limit. If config error, regenerate config and restart."
+- **Set boundaries, not steps**: "Never delete user data without explicit instruction" rather than "Step 1: check, Step 2: delete"
+- **Keep it under 1000 tokens**: Pi's own system prompt is ~200 tokens. Models are RL-trained for agentic behavior — they don't need 10K tokens of instruction.
+
+### Filesystem as Agent Memory
+
+The filesystem is the universal persistence layer for agents. It is unlimited, persistent, directly operable, and requires no special tools.
+
+**Patterns:**
+- **State files**: Agent writes `state.json` with current progress; reads it on next invocation for continuity
+- **Plan files**: Agent writes `PLAN.md` with task breakdown; updates checkboxes as it progresses
+- **Shared memory**: Multiple agent sessions read/write the same workspace directory; filesystem is the coordination mechanism
+- **Reinforcement via files**: After each tool call, inject filesystem state into context to keep the agent aware of overall progress
+
+> "File System as Extended Memory: unlimited in size, persistent by nature, and directly operable by the agent itself." — Manus
+
+## Pi-Mono SDK Integration
+
+### Choose Your Layer
+
+```
+Layer 3: pi-coding-agent  → createAgentSession() — full app (sessions, extensions, skills)
+Layer 2: pi-agent-core    → agentLoop()           — engine (tool calling, events, state)
 Layer 1: pi-ai            → stream() / complete()  — LLM interface (multi-provider, tools)
 ```
 
 | Scenario | Layer | Entry Point |
 |----------|-------|-------------|
-| Embed agent in existing web app | 3 | `createAgentSession()` |
+| Full agent app with sessions, extensions | 3 | `createAgentSession()` |
 | Agent as isolated subprocess | 3 | `pi --mode rpc` |
-| Full control over agent loop | 2 | `agentLoop()` |
-| Only need LLM + tool calling | 1 | `stream()` / `complete()` |
+| Custom agent loop with full control | 2 | `agentLoop()` |
+| Single LLM call with tool use | 1 | `stream()` / `complete()` |
 
-## Tool Architecture: The Hybrid Model
-
-Do NOT choose between bash and custom tools. Use a **three-layer hybrid**:
-
-```
-Layer 1: bash (general primitive)    → exploration, diagnostics, flexible ops
-Layer 2: read/write/edit (optimized) → more reliable than bash for file ops
-Layer 3: custom tools (business)     → safety-critical ops, structured output, transactions
-+ Skills (knowledge injection)       → teach agent HOW to use Layer 1-3 for specific domains
-```
-
-**Decision framework for each operation:**
-
-1. Security-sensitive? → Custom tool (hardcode checks in `execute`)
-2. Needs structured output for app layer? → Custom tool (return JSON)
-3. Involves DB/external API/transactions? → Custom tool (encapsulate logic)
-4. Model can do it reliably with bash? → bash + skill guidance
-5. High-frequency file operation? → Optimized primitive (read/write/edit)
-
-**Why bash is powerful:** Infinite surface area, model familiarity from training data, composable via pipes, context-efficient (one 200-token tool definition). But bash has **no safety boundary** — never trust System Prompt as security; all security checks must be hardcoded in tool `execute` functions.
-
-See [references/tool-design.md](references/tool-design.md) for detailed tool design patterns, Anthropic research analysis, and code examples.
-
-## Development Patterns
-
-### Pattern 1: SDK Embedded Agent (most common)
-
-For embedding agent execution into a web service or backend:
+### Pattern 1: Minimal Agent App (most recommended)
 
 ```typescript
-import { createAgentSession, SessionManager, DefaultResourceLoader, type ToolDefinition } from "@mariozechner/pi-coding-agent";
+import { createAgentSession, SessionManager, DefaultResourceLoader } from "@mariozechner/pi-coding-agent";
 import { getModel } from "@mariozechner/pi-ai";
-import { Type } from "@sinclair/typebox";
 
-// 1. Define business tools with safety checks in execute()
-const myTool: ToolDefinition = {
-  name: "do_something",
-  label: "Do Something",
-  description: "What this tool does (shown to LLM)",
-  parameters: Type.Object({
-    target: Type.String({ description: "target identifier" }),
-  }),
-  execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-    // SECURITY: hardcoded checks here — LLM cannot bypass
-    if (!isAuthorized(currentUserId, params.target)) throw new Error("Unauthorized");
-    onUpdate?.({ content: [{ type: "text", text: "Working..." }] }); // stream progress
-    const result = await performAction(params.target);
-    return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
-  },
-};
-
-// 2. Configure system prompt via ResourceLoader
 const loader = new DefaultResourceLoader({
-  systemPromptOverride: () => `You are an execution engine. Execute intent directly, verify results, auto-fix on failure.`,
+  systemPromptOverride: () => SYSTEM_PROMPT,
 });
 await loader.reload();
 
-// 3. Create session and run
 const { session } = await createAgentSession({
   model: getModel("anthropic", "claude-sonnet-4-20250514"),
   resourceLoader: loader,
-  customTools: [myTool],
-  tools: [],  // omit built-in tools if not needed, or keep bash via createBashTool()
+  customTools: securityCriticalToolsOnly, // minimal — 0 to 3 tools max
+  tools: [],  // or include bash via createBashTool() for full capability
   sessionManager: SessionManager.inMemory(),
 });
 
-// 4. Collect results via events
-const executions: any[] = [];
-session.subscribe((event) => {
-  if (event.type === "tool_execution_end") executions.push({ tool: event.toolName, ok: !event.isError });
-});
-
-await session.prompt("Deploy the app to staging");
+await session.prompt(userIntent);
 ```
 
-### Pattern 2: Agent-as-Backend (RPC subprocess)
+### Pattern 2: Bare Loop (maximum control)
 
-For process isolation (how OpenClaw integrates):
+```typescript
+import { agentLoop, type AgentContext, type AgentLoopConfig } from "@mariozechner/pi-agent-core";
+
+const context: AgentContext = { systemPrompt: PROMPT, messages: [], tools: myTools };
+const config: AgentLoopConfig = {
+  model: getModel("anthropic", "claude-sonnet-4-20250514"),
+  convertToLlm: (msgs) => msgs.filter(m => ["user","assistant","toolResult"].includes(m.role)),
+  getApiKey: (provider) => keys[provider],
+};
+
+for await (const event of agentLoop([userMessage], context, config)) {
+  if (event.type === "tool_execution_end") console.log(`${event.toolName}: ${event.isError ? "FAIL" : "OK"}`);
+}
+```
+
+### Pattern 3: RPC Subprocess (process isolation)
 
 ```bash
 pi --mode rpc --no-session -e ./my-extension.ts
 ```
 
-Communicate via JSON over stdin/stdout. Send `{"type":"prompt","message":"..."}`, receive event stream. See [references/integration-patterns.md](references/integration-patterns.md) for RPC protocol details.
+Communicate via JSON over stdin/stdout. Send `{"type":"prompt","message":"..."}`, receive event stream.
 
-### Pattern 3: Bare Agent Loop (maximum control)
-
-```typescript
-import { agentLoop, type AgentContext, type AgentLoopConfig } from "@mariozechner/pi-agent-core";
-import { getModel } from "@mariozechner/pi-ai";
-
-const context: AgentContext = { systemPrompt: "...", messages: [], tools: [myTool] };
-const config: AgentLoopConfig = {
-  model: getModel("anthropic", "claude-sonnet-4-20250514"),
-  convertToLlm: (msgs) => msgs.filter(m => ["user","assistant","toolResult"].includes(m.role)),
-};
-
-for await (const event of agentLoop([userMessage], context, config)) {
-  if (event.type === "tool_execution_end") console.log(`Tool ${event.toolName} done`);
-}
-```
-
-### Pattern 4: Minimal LLM + Tool Loop (pi-ai only)
-
-```typescript
-import { getModel, complete, Type, type Context, type Tool } from "@mariozechner/pi-ai";
-
-const tools: Tool[] = [{ name: "act", description: "...", parameters: Type.Object({...}) }];
-const context: Context = { systemPrompt: "...", messages: [{ role: "user", content: "..." }], tools };
-
-for (let turn = 0; turn < 10; turn++) {
-  const response = await complete(getModel("anthropic", "claude-sonnet-4-20250514"), context);
-  context.messages.push(response);
-  const calls = response.content.filter(b => b.type === "toolCall");
-  if (!calls.length) break; // agent considers task complete
-  for (const call of calls) {
-    const result = await executeTool(call.name, call.arguments);
-    context.messages.push({ role: "toolResult", toolCallId: call.id, toolName: call.name,
-      content: [{ type: "text", text: JSON.stringify(result) }], isError: false, timestamp: Date.now() });
-  }
-}
-```
+See [references/integration-patterns.md](references/integration-patterns.md) for full protocol details and examples.
 
 ## Security Model
 
-**Golden rule: NEVER trust System Prompt as a security boundary.** LLMs can be prompt-injected. All security MUST be hardcoded in tool `execute` functions.
-
-Five-layer defense:
+**Golden rule: NEVER trust System Prompt as a security boundary.** All security MUST be hardcoded in tool `execute()` functions or enforced via extension event gates.
 
 | Layer | Mechanism | Reliability |
 |-------|-----------|-------------|
-| Tool-level validation | Hardcoded checks in `execute()` | ★★★★★ Strongest |
-| Extension event gates | `pi.on("tool_call", …)` → `{ block: true }` | ★★★★ Strong |
-| Code execution sandbox | Monty / CodeMode / Docker / E2B | ★★★★★ Strongest |
-| System Prompt rules | "Do not delete..." in prompt | ★★ Weak (bypassable) |
-| Infrastructure isolation | Container, cgroup, network namespace | ★★★★★ Strongest |
+| Tool-level validation | Hardcoded checks in `execute()` | ★★★★★ |
+| Extension event gates | `pi.on("tool_call", …)` → `{ block: true }` | ★★★★ |
+| Infrastructure isolation | Container, cgroup, network namespace | ★★★★★ |
+| System Prompt rules | "Do not delete..." in prompt | ★★ Weak |
 
-**Code execution sandboxing** is now an industry consensus for production agents. Options range from embedded interpreters (Pydantic Monty: <1μs startup) to isolated workers (Cloudflare CodeMode) to cloud sandboxes (E2B, Daytona). See [references/security.md](references/security.md) for full comparison table and implementation patterns.
-
-## Observability, Debugging & Monitoring
-
-Agent apps are **non-deterministic, multi-step, and expensive**. Unlike traditional software, there's no `EXPLAIN` query — you need full-stack observability to understand agent behavior.
-
-**Industry consensus (2025-2026):** All major frameworks (OpenAI Agents SDK, PydanticAI/Logfire, LangChain/LangSmith, Agno, Cloudflare AI Gateway) converge on a **Traces → Spans** hierarchy aligned with OpenTelemetry GenAI Semantic Conventions (v1.40.0).
-
-**Pi-mono's observability primitives:**
-
-| Primitive | What it gives you |
-|-----------|-------------------|
-| `session.subscribe(event)` | Full event stream: agent/turn/message/tool lifecycle |
-| `event.message.usage` | Per-turn token counts + cost breakdown (input/output/cache) |
-| `session.getSessionStats()` | Aggregate session-level metrics |
-| `session.getContextUsage()` | Real-time context window utilization |
-| `StreamOptions.onPayload` | Raw provider HTTP payload inspection ("show me the prompt") |
-| `session.exportToHtml()` | Full conversation replay for debugging |
-
-**Six pillars to implement:**
-
-1. **Structured tracing** — emit JSON logs with traceId/spanId for every LLM call and tool execution
-2. **Cost monitoring** — per-request budgets, per-user/24h limits, per-tool cost attribution
-3. **Error classification** — categorize failures (LLM API error, tool error, context overflow, agent stuck loop, budget exceeded)
-4. **Performance profiling** — time-to-first-token, tool execution duration, turn count, total latency
-5. **OTel bridge** — map pi-mono events to OpenTelemetry spans for export to any observability platform (Langfuse, Logfire, LangSmith, Datadog, etc.)
-6. **Eval-driven quality** — automated checks per agent run (completion, expected tools, cost bounds, loop detection) + regression test datasets
-
-See [references/observability.md](references/observability.md) for detailed architecture, all 9 implementation patterns with code, OTel integration, and production checklist.
+For code execution sandboxing options (Docker, E2B, Monty, Cloudflare CodeMode), see [references/security.md](references/security.md).
 
 ## Production Essentials
 
-**Cost control**: Monitor `event.message.usage.cost.total` per turn; abort if budget exceeded. See observability patterns for per-user/24h budget enforcement.
+**Cost control**: Monitor `event.message.usage.cost.total` per turn; abort if budget exceeded. Use cheap models for simple tasks, strong models for complex ones.
 
-**Timeout**: Use `AbortController` with total timeout; set max turns in settings.
+**Timeout**: `AbortController` with total timeout; set max turns as a safety net.
 
-**Structured output**: Define a `report_result` tool and instruct in System Prompt: "Always call report_result when task completes." This gives your app layer structured JSON instead of free text.
+**Structured output**: Use a `report_result` tool only as the final structured reporting mechanism — not as the agent's primary communication channel.
 
-**Multi-model strategy**: Use cheap model (Haiku) for simple tasks, strong model (Sonnet/Opus) + thinking for complex tasks. Pi-ai's `getModel()` makes switching trivial.
+**Reinforcement**: After tool calls, inject reminders of the overall objective and current state. Armin Ronacher: *"Every time the agent runs a tool you have the opportunity to feed more information back into the loop — remind it about the overall objective and the status of individual tasks."*
 
-**Context management**: For long tasks, enable compaction in settings. For cross-request memory, serialize `Context` with `JSON.stringify()` and restore later — works across providers.
+**Failure isolation**: Run subtasks that might fail repeatedly in sub-agents. Report only the success plus a brief summary of what didn't work, avoiding context pollution from failed attempts.
 
-See [references/production.md](references/production.md) for detailed patterns with code.
+**Verification loops**: The single most important production pattern. Encode in system prompt:
+1. Execute the action
+2. Verify the result (curl health check, run tests, inspect state)
+3. If verification fails: diagnose (read logs), attempt fix, re-verify
+4. If fix fails after N attempts: report failure with diagnostic context
 
-## Extension System for Agent Apps
-
-Extensions add capabilities beyond tools. Key patterns for agent apps:
-
-- **Permission gates**: `pi.on("tool_call")` to block dangerous operations
-- **Context injection**: `pi.on("before_agent_start")` to inject runtime context (user info, system state)
-- **Custom commands**: `pi.registerCommand()` for operator actions
-- **State persistence**: `pi.appendEntry()` for data that survives restarts
-- **Structured reporting**: `pi.registerTool()` with custom `renderResult` for rich output
-
-See [references/integration-patterns.md](references/integration-patterns.md) for extension examples.
-
-## Context Engineering
-
-Context is a **finite resource with diminishing returns**. Principles:
-
-1. **Minimal tool set**: Every tool definition costs tokens. Prefer bash + few critical custom tools over dozens of specific tools.
-2. **Progressive disclosure**: Use Skills and `CLAUDE.md`/`AGENTS.md` for just-in-time context. Don't dump everything into System Prompt.
-3. **Token-efficient tool responses**: Truncate large outputs (use `truncateHead`/`truncateTail` from pi-coding-agent). Always inform the LLM where to find full output.
-4. **Compaction**: For long tasks, configure `compaction.enabled: true` in settings. Pi auto-summarizes old messages when context nears the limit.
-5. **Agentic search over pre-loading**: Let the agent use bash (`grep`, `find`, `head`) to discover information on-demand rather than pre-loading everything into context.
+See [references/production.md](references/production.md) for detailed patterns, observability, and testing guidance.
 
 ## Quick Reference: Key Imports
 
 ```typescript
 // Layer 3 (full SDK)
 import { createAgentSession, SessionManager, SettingsManager, AuthStorage, ModelRegistry,
-  DefaultResourceLoader, codingTools, readOnlyTools, createCodingTools,
-  type ToolDefinition, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
+  DefaultResourceLoader, createBashTool, type ToolDefinition, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 // Layer 2 (agent engine)
-import { Agent, agentLoop, agentLoopContinue } from "@mariozechner/pi-agent-core";
+import { agentLoop } from "@mariozechner/pi-agent-core";
 
 // Layer 1 (LLM interface)
-import { getModel, stream, complete, Type, StringEnum, type Context, type Tool } from "@mariozechner/pi-ai";
+import { getModel, stream, complete, Type, type Context, type Tool } from "@mariozechner/pi-ai";
 ```
 
 ## References
 
-- [references/tool-design.md](references/tool-design.md) — Bash vs custom tools analysis, hybrid architecture, Anthropic research findings, tool code examples
-- [references/security.md](references/security.md) — Five-layer security model, code execution sandbox comparison (Monty/CodeMode/Docker/E2B/Daytona/SmolAgents), sandbox implementation patterns, human-in-the-loop
-- [references/integration-patterns.md](references/integration-patterns.md) — SDK embedding, RPC subprocess, extension patterns, OpenClaw case study
-- [references/observability.md](references/observability.md) — Trace/span architecture, cost monitoring, error classification, performance profiling, OTel bridge, production alerting, session replay, eval-driven quality, industry analysis (OpenAI/PydanticAI/LangChain/Agno/Cloudflare)
-- [references/production.md](references/production.md) — Cost control, timeouts, multi-model, context management, structured output, testing
-
-## Development Feedback Collection (Optional)
-
-This skill is actively maintained. When encountering genuine friction points during
-real development, log them to `<project>/.pidev_feedback/<YYYY-MM-DD>_<short-topic>.md`.
-
-Three types worth recording:
-
-1. **Gap** — A recurring problem/pattern this skill doesn't cover but should
-2. **Correction** — Skill guidance that didn't work as described
-3. **Improvement** — Guidance that worked but could be clearer or more complete
-
-Each entry should contain:
-
-- **Type**: Gap / Correction / Improvement
-- **Scenario**: What was being built or done (describe the task only — no usernames, API keys, internal URLs, or any identifying information)
-- **Issue**: What happened, or what was missing
-- **Resolution**: How it was actually solved (if resolved)
-
-Only create this directory and log entries when a real issue is encountered — do not
-proactively generate feedback. Contributors can submit these files as issues at
-https://github.com/Crokily/pi-agent-app-dev to help improve this skill.
+- [references/tool-design.md](references/tool-design.md) — Bash-first philosophy, when to create custom tools, anti-patterns, code examples
+- [references/security.md](references/security.md) — Five-layer defense, sandbox comparison (Monty/CodeMode/Docker/E2B), human-in-the-loop
+- [references/integration-patterns.md](references/integration-patterns.md) — SDK embedding, RPC subprocess, extension patterns
+- [references/production.md](references/production.md) — Verification loops, cost control, reinforcement, failure isolation, observability, testing

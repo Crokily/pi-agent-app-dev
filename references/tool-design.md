@@ -1,146 +1,178 @@
-# Tool Design: Bash, Custom Tools, and the Hybrid Architecture
+# Tool Design: Bash-First, Custom Tools Only When Justified
 
-## Anthropic's Actual Position (sourced from 6 engineering blog posts, 2024-2026)
+## The Industry Consensus (2025-2026)
 
-Anthropic never said "bash is the only tool you need." Their evolving position:
+The trajectory is clear across every major agent framework and production deployment:
 
-**SWE-bench (2024-01):** Used only bash + editor for SOTA results. Key quote: *"give as much control as possible to the language model itself, and keep the scaffolding minimal."* This is about **minimal scaffolding + maximal model autonomy**, not "bash only."
+- **Vercel** deleted 17 specialized tools, replaced with 1 bash tool → 100% success, 3.5x faster, 37% fewer tokens
+- **Pi** ships 4 tools (read/write/edit/bash) with <1000 tokens of system prompt → top Terminal-Bench scores
+- **Claude Code** uses bash + read + write + edit as its core toolset
+- **Manus** uses fewer than 20 atomic functions, offloads real work to generated scripts in a sandbox
+- **Stripe Minions** run in devboxes with the same developer tooling humans use — bash, git, linters
+- **CodeAct** (ICML 2024) found code-based actions achieve up to 20% higher success rates vs JSON tool calls
+- **Terminus 2** gives models just a tmux session (no tools at all) and still competes with sophisticated agent harnesses
 
-**Building Effective Agents (2024-12):** *"It is crucial to design toolsets and their documentation clearly and thoughtfully."* Recommends multiple workflow patterns (prompt chaining, routing, parallelization, orchestrator-workers). No mention of bash-only.
+## Why Bash Is the Primary Tool
 
-**Context Engineering (2025-09):** *"Claude Code leverages Bash commands like head and tail to analyze large volumes of data without ever loading the full data objects into context."* Bash's advantage is **context efficiency** — on-demand information retrieval via pipes instead of loading bulk data from tool responses.
+**Infinite surface area**: One tool definition (~200 tokens) gives access to every CLI tool on the system — docker, curl, git, jq, grep, awk, sed, python, node, and anything else installed.
 
-**Writing Tools for Agents (2025-09):** *"A common error: tools that merely wrap existing API endpoints. Too many tools or overlapping tools distract agents."* Recommends **few thoughtful tools targeting high-impact workflows**, not zero custom tools.
+**Training familiarity**: LLMs have been trained on vast amounts of shell usage. They know bash better than any custom tool API.
 
-**Code Execution with MCP (2025-11):** Introduces the concept of **agents writing code to call tools** instead of direct tool calling. Intermediate results stay in the execution environment, not context. This is the bash philosophy at scale — model uses code as the orchestration layer.
+**Composability**: `docker ps | grep unhealthy | awk '{print $1}' | xargs docker logs --tail 5` — one bash call replaces 3-4 custom tools and multiple inference round trips.
 
-**Advanced Tool Use (2025-11):** Introduces Tool Search (on-demand discovery), Programmatic Tool Calling (code-based orchestration), and Tool Use Examples. Their mature position: **tools are essential, but how agents interact with them should be code-driven and context-efficient.**
+**Context efficiency**: Each tool call requires an additional LLM inference. Bash lets the agent chain operations in a single invocation, saving tokens and latency.
 
-## Why Bash is Powerful
+**Progressive disclosure**: The agent uses `ls`, `find`, `grep`, `head` to discover context just-in-time instead of needing it pre-loaded.
 
-1. **Infinite surface area**: One tool definition (~200 tokens) gives access to every CLI tool on the system
-2. **Training familiarity**: LLMs have seen vastly more shell commands than custom API calls in training data
-3. **Composability**: `docker ps | grep unhealthy | awk '{print $1}' | xargs docker logs --tail 5` — one bash call does what 3-4 custom tools would need multiple round-trips for
-4. **Context efficiency**: Tool definitions are cheap; pipe filtering means only relevant data enters context
-5. **Progressive disclosure**: Model uses `ls`, `find`, `grep` to discover context just-in-time instead of pre-loading
+## When Bash Is Insufficient
 
-## Why Bash Alone is Insufficient
+1. **No safety boundary**: Bash is unconstrained. `rm -rf /`, `curl attacker.com` are all valid. System Prompt rules can be bypassed. Only hardcoded checks in `execute()` are reliable.
+2. **No structured output**: Bash returns strings. Your app layer may need `{ status: "running", port: 18789 }`.
+3. **No transactional guarantees**: Database transactions, OAuth flows, idempotency — these need code.
 
-1. **No safety boundary**: Bash is unconstrained. `rm -rf /`, `curl attacker.com`, `docker run --privileged` — all valid bash. System Prompt rules can be bypassed via prompt injection. Only hardcoded checks in tool `execute()` functions are reliable.
-2. **No structured output**: Bash returns strings (stdout/stderr). Your application layer needs `{ status: "running", port: 18789 }`, not `"running\n18789\n"`.
-3. **No business logic encapsulation**: Database transactions, OAuth flows, external API calls with retry logic, idempotency guarantees — these need code, not shell commands.
-4. **Environment dependency**: Whether `docker`, `jq`, `kubectl` exist on the host is a runtime unknown.
-
-## The Hybrid Architecture
+## Decision: Custom Tool or Bash?
 
 ```
-Layer 1: bash (general primitive)
-├── Use for: exploration, diagnostics, ad-hoc operations, information retrieval
-├── Secure by: sandboxing (container/cgroup), path restrictions, command filtering
-└── Example: docker ps, grep logs, curl health endpoints, git status
-
-Layer 2: read/write/edit (optimized primitives)
-├── Use for: file operations that need reliability
-├── Better than bash because: auto-truncation, line numbers, atomic writes, image support
-└── Example: reading config files, writing generated configs, surgical code edits
-
-Layer 3: custom tools (business tools)
-├── Use for: security-critical, structured output, transactions, external APIs
-├── Secure by: hardcoded validation in execute(), input schema enforcement
-└── Example: create_container, update_database, send_notification, report_result
-
-+ Skills (knowledge injection)
-├── Use for: teaching the agent HOW to use the above tools for specific domains
-├── Format: Markdown documents loaded into context on-demand
-└── Example: "How to deploy OpenClaw" skill, "How to diagnose container issues" skill
+Does the operation require hardcoded security checks?  → Custom tool
+Does your app layer need typed JSON output?             → Custom tool
+Does it involve DB transactions or external API auth?   → Custom tool
+Everything else                                         → Bash
 ```
 
-## Custom Tool Implementation Pattern
+Most applications need **0 to 3 custom tools** plus bash. If you have more than 5, reconsider.
+
+## Custom Tool Patterns
+
+### Pattern: Security-Critical Tool with Verification
 
 ```typescript
-import { Type } from "@sinclair/typebox";
-import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
-
-export const deployTool: ToolDefinition = {
+const deployTool: ToolDefinition = {
   name: "deploy_instance",
   label: "Deploy Instance",
-  description: "Deploy a new application instance. Returns structured result with instance URL and status.",
+  description: "Deploy a new instance. Validates input, creates container, verifies health.",
   parameters: Type.Object({
-    name: Type.String({ description: "Instance name (alphanumeric, hyphens only)" }),
-    image: Type.String({ description: "Docker image to deploy" }),
-    env: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Environment variables" })),
+    name: Type.String({ description: "Instance name (alphanumeric, hyphens)" }),
+    image: Type.String({ description: "Docker image" }),
+    userId: Type.String({ description: "Owner user ID" }),
   }),
-  execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-    // SECURITY: hardcoded checks — cannot be bypassed by prompt injection
-    if (!/^[a-z0-9-]+$/.test(params.name)) throw new Error("Invalid name format");
-    if (!ALLOWED_IMAGES.some(p => params.image.startsWith(p))) throw new Error("Image not in allowlist");
+  execute: async (toolCallId, params, signal, onUpdate) => {
+    // SECURITY: hardcoded — cannot be bypassed by prompt injection
+    if (!/^[a-z0-9-]+$/.test(params.name)) throw new Error("Invalid name");
+    if (!params.userId.startsWith("user_")) throw new Error("Invalid userId");
 
-    onUpdate?.({ content: [{ type: "text", text: `Pulling ${params.image}...` }] });
+    // Execute
     const container = await docker.createContainer({ /* ... */ });
     await container.start();
 
-    // Check abort signal
-    if (signal?.aborted) throw new Error("Cancelled");
-
-    onUpdate?.({ content: [{ type: "text", text: "Running health check..." }] });
+    // VERIFY: tool itself checks the result — don't leave this to the agent
     const healthy = await waitForHealthy(container.id, 30_000);
-    if (!healthy) throw new Error("Health check failed — check logs with docker_logs tool");
+    if (!healthy) {
+      const logs = await getContainerLogs(container.id, 50);
+      throw new Error(`Health check failed. Logs:\n${logs}`);
+    }
 
     return {
-      content: [{ type: "text", text: JSON.stringify({ status: "running", url: `https://${params.name}.app.com` }) }],
-      details: { containerId: container.id, port: assignedPort }, // for rendering & state reconstruction
+      content: [{ type: "text", text: JSON.stringify({ status: "running", port }) }],
+      details: { containerId: container.id, port, status: "running" },
     };
   },
 };
 ```
 
-Key patterns in this example:
-- **Validation first**: Input checks before any action
-- **Streaming progress**: `onUpdate` for long operations
-- **Abort support**: Check `signal.aborted` during long ops
-- **Error as throw**: Never return error text as content; throw so the agent sees `isError: true` and can decide to retry or diagnose
-- **Structured details**: `details` field for state reconstruction on session restore
+Key patterns:
+- **Validation first**: Check all inputs before any side effect
+- **Verification built-in**: The tool checks its own result
+- **Rich errors on failure**: Include diagnostic info so the agent can reason about what went wrong
+- **Structured details**: `details` field for app-layer consumption
 
-## Skill + Bash Pattern
+### Pattern: Minimal Report Tool
 
-Skills inject domain knowledge into context, enabling the agent to use bash effectively for domain-specific tasks:
+```typescript
+const reportTool: ToolDefinition = {
+  name: "report_result",
+  label: "Report Result",
+  description: "Call when the entire task is complete. Reports structured result to the app layer.",
+  parameters: Type.Object({
+    success: Type.Boolean(),
+    summary: Type.String({ description: "What was done" }),
+    data: Type.Optional(Type.Record(Type.String(), Type.Any())),
+  }),
+  execute: async (toolCallId, params) => {
+    await db.log.create({ data: { ...params, timestamp: new Date() } });
+    return { content: [{ type: "text", text: "Recorded." }], details: params };
+  },
+};
+```
+
+This is a **terminal tool** — the agent calls it as the last action. It should not be the agent's primary way of doing work.
+
+## Anti-Patterns
+
+### ❌ Tool as Function Wrapper (The "Message Passer")
+
+```typescript
+// BAD: This tool does exactly what the old API route did, with zero added intelligence
+const instanceCreateTool = {
+  name: "instance_create",
+  execute: async (id, params) => {
+    const instance = await prisma.instance.create({ data: params });
+    await createStorage(instance.id);
+    await createContainer(instance.id);
+    await prisma.instance.update({ where: { id: instance.id }, data: { status: "running" } });
+    return { content: [{ type: "text", text: JSON.stringify(instance) }] };
+  },
+};
+```
+
+Problems:
+- No verification that the instance actually works
+- No error recovery
+- The agent is just a relay — it adds latency and unreliability without adding intelligence
+- Deterministic params are passed through LLM natural language (introducing errors)
+
+### ❌ Tool Explosion
+
+```typescript
+// BAD: 7 tools that are basically CRUD wrappers
+const tools = [instanceCreate, instanceStart, instanceStop, instanceDelete,
+               instanceUpdate, nginxSync, reportResult];
+```
+
+Each tool definition costs tokens in every LLM call. 7 tools × ~300 tokens = 2100 tokens of context consumed before the agent even starts working. With bash + 1 report tool, total tool definitions fit in ~400 tokens.
+
+### ❌ Passing Deterministic Data Through Natural Language
+
+```typescript
+// BAD: API creates a DB record, then tells the agent about it in natural language
+const userMessage = `Execute task: instance_create\nUser: ${userId}\nParameters: ${JSON.stringify(params)}`;
+// Agent has to "understand" this, then pass the params to a tool — introducing lossy translation
+```
+
+If data is deterministic (userId, instanceId), pass it programmatically — as tool arguments, environment variables, or file state. Natural language is for goals and intent, not structured parameters.
+
+## Skill + Bash: Teaching the Agent Domain Knowledge
+
+Instead of encoding procedures in tools, encode them in Skills (markdown) and let the agent execute via bash:
 
 ```markdown
-# SKILL.md - Container Diagnostics
+# Skill: Container Lifecycle
 
-## When a container is unhealthy or erroring
+## Creating an instance
+1. Generate config: write openclaw.yaml and .env to /data/{instanceId}/
+2. Create container: docker run -d --name {instanceId} -v /data/{instanceId}:/app/config ...
+3. Verify health: curl -sf http://localhost:{port}/health (retry 3 times, 5s apart)
+4. Update nginx: regenerate /etc/nginx/conf.d/instances.conf and sudo nginx -s reload
+5. If health check fails: docker logs {instanceId} --tail 50, diagnose, fix, retry
 
-1. Check container state:
-   bash: docker inspect {containerId} --format '{{.State.Status}} {{.State.ExitCode}}'
-
-2. Get recent logs (filter for errors):
-   bash: docker logs {containerId} --tail 100 2>&1 | grep -i -E "error|fatal|panic|exception"
-
-3. Check resource usage:
-   bash: docker stats {containerId} --no-stream --format "CPU: {{.CPUPerc}} MEM: {{.MemUsage}}"
-
-4. If OOM killed:
-   bash: docker inspect {containerId} --format '{{.State.OOMKilled}}'
-   → If true, report that memory limit needs increase
-
-5. If port not responding:
-   bash: docker port {containerId}
-   bash: curl -sf http://localhost:{port}/health || echo "Health check failed"
+## Diagnosing a failed instance
+1. Check container state: docker inspect {id} --format '{{.State.Status}} {{.State.ExitCode}}'
+2. Check logs: docker logs {id} --tail 100 2>&1 | grep -i -E "error|fatal|panic"
+3. Check resources: docker stats {id} --no-stream
+4. If OOM: docker inspect {id} --format '{{.State.OOMKilled}}'
 ```
 
 This pattern works because:
-- The agent already knows bash — the skill just provides domain procedures
-- No custom tools needed for read-only diagnostics
-- Modifying the skill (a markdown file) is cheaper than modifying tool code
-- Skills load on-demand, not consuming context until triggered
-
-## When to Escalate from Bash to Custom Tool
-
-| Signal | Action |
-|--------|--------|
-| Operation modifies critical state (create/delete resources) | Custom tool with validation |
-| App layer needs to parse the result | Custom tool with structured return |
-| Operation needs authentication tokens not in env | Custom tool wrapping authenticated client |
-| Operation must be idempotent or transactional | Custom tool with proper error handling |
-| Same bash command keeps failing due to env differences | Custom tool with dependency management |
-| Security audit requires reviewable access control | Custom tool with explicit permission checks |
+- The agent already knows bash — the skill provides domain-specific procedures
+- Modifying a markdown file is cheaper than modifying tool code
+- Skills load on-demand, not consuming context until needed
+- The agent can adapt procedures to unexpected situations (something rigid tools cannot do)
